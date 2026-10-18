@@ -3,9 +3,10 @@ import { join } from "node:path";
 
 /** How much memory the instance can still take before it swaps or is killed. */
 export interface MemoryHeadroom {
-  /** Which cgroup version supplied the reading. */
-  source: "cgroup-v2" | "cgroup-v1";
-  /** The memory limit the container runs under, in bytes. */
+  /** Which reading supplied the numbers: the container's cgroup limit, or the
+   * Linux host's `/proc/meminfo` when no cgroup limit applies. */
+  source: "cgroup-v2" | "cgroup-v1" | "meminfo";
+  /** The memory limit the instance runs under, in bytes. */
   limitBytes: number;
   /** Bytes still allocatable under that limit. Reclaimable file cache counts
    * as available, since the kernel drops it before it swaps anonymous memory. */
@@ -18,13 +19,21 @@ export type MemoryHeadroomReader = () => MemoryHeadroom | null;
 const CGROUP_V1_UNLIMITED = 2 ** 60;
 
 /**
- * Reads the container's memory headroom from its cgroup limit (v2, then v1).
- * Returns null when no cgroup limit applies: the desktop app and a bare host
- * have no limit to measure against, and the host's free-page count understates
- * what is really available, so no reading is better than a misleading one.
+ * Reads the instance's memory headroom. A cgroup limit (v2, then v1) wins when
+ * one applies and fits in the host's memory. Otherwise the Linux kernel's own
+ * `MemAvailable` estimate stands in, because a hosted instance often sits at
+ * the root of its cgroup namespace with the limit set a level above it.
+ * Returns null where neither exists, such as the Mac app, whose free-page
+ * count would understate what is really available.
  */
-export function readMemoryHeadroom(cgroupRoot = "/sys/fs/cgroup"): MemoryHeadroom | null {
-  return readCgroupV2(cgroupRoot) ?? readCgroupV1(cgroupRoot);
+export function readMemoryHeadroom(
+  cgroupRoot = "/sys/fs/cgroup",
+  meminfoPath = "/proc/meminfo",
+): MemoryHeadroom | null {
+  const host = readMeminfo(meminfoPath);
+  const cgroup = readCgroupV2(cgroupRoot) ?? readCgroupV1(cgroupRoot);
+  if (cgroup && (!host || cgroup.limitBytes <= host.limitBytes)) return cgroup;
+  return host;
 }
 
 function readCgroupV2(root: string): MemoryHeadroom | null {
@@ -41,6 +50,21 @@ function readCgroupV1(root: string): MemoryHeadroom | null {
   if (limit === null || usage === null || limit >= CGROUP_V1_UNLIMITED) return null;
   const inactiveFile = readStat(join(root, "memory", "memory.stat"), "total_inactive_file") ?? 0;
   return headroom("cgroup-v1", limit, usage - inactiveFile);
+}
+
+/** `/proc/meminfo` lists kB values as `MemTotal:  16318920 kB`. */
+function readMeminfo(path: string): MemoryHeadroom | null {
+  const text = readText(path);
+  if (text === null) return null;
+  const fields = new Map<string, number>();
+  for (const line of text.split("\n")) {
+    const match = /^(\w+):\s+(\d+)/.exec(line);
+    if (match) fields.set(match[1], Number(match[2]) * 1024);
+  }
+  const total = fields.get("MemTotal");
+  const available = fields.get("MemAvailable");
+  if (total === undefined || available === undefined || !(total > 0)) return null;
+  return headroom("meminfo", total, total - available);
 }
 
 function headroom(

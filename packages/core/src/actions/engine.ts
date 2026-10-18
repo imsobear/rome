@@ -206,9 +206,10 @@ interface ActionEngineOptions {
   /** How long a queued root waits for a worker before it fails with
    * {@link ActionWorkerCapacityError}. Defaults to ten minutes. */
   queuedRootMaxWaitMs?: number;
-  /** Reads the container's memory headroom when a queued root could take a
-   * worker. Defaults to the cgroup limit, which is absent outside a container
-   * and then never holds the queue. Tests inject a controllable reading. */
+  /** Reads the instance's memory headroom when a queued root could take a
+   * worker. Defaults to the cgroup limit, then Linux's `/proc/meminfo`; where
+   * neither exists (the Mac app) the gate never holds. Tests inject a
+   * controllable reading. */
   memoryHeadroom?: MemoryHeadroomReader;
   /**
    * Number of already-initialized action workers to keep ready in the main
@@ -304,6 +305,9 @@ interface ActiveRootProcess {
 interface QueuedRoot {
   rootExecutionId: string;
   queuedAt: number;
+  /** Set once the memory gate holds this root, so a timeout names the reason
+   * this root waited rather than the gate's state at the deadline. */
+  heldByMemory: boolean;
   deadline: ClockTimer;
   admit: (worker: ActionWorkerProcess) => void;
   reject: (error: Error) => void;
@@ -364,6 +368,9 @@ export class ActionEngine {
    * per recheck, so each admitted root shows up in the next reading before the
    * following one starts. */
   private memoryPaced = false;
+  /** When the last paced admission happened. Slot-open events inside the
+   * recheck window admit nothing; the timer takes the next one. */
+  private lastPacedAdmitAt: number | null = null;
   private queueRecheckTimer: ClockTimer | null = null;
   private workerWarmPoolStarted = false;
   private workerPoolGeneration = 0;
@@ -1287,6 +1294,7 @@ export class ActionEngine {
     if (
       this.queuedRoots.length === 0 &&
       this.canAdmitQueuedRoot() &&
+      !(this.memoryPaced && this.insidePacingWindow()) &&
       this.memoryAllowsAdmission()
     ) {
       return Promise.resolve(this.checkoutWorker(true));
@@ -1296,6 +1304,7 @@ export class ActionEngine {
       const entry: QueuedRoot = {
         rootExecutionId,
         queuedAt,
+        heldByMemory: this.memoryHeld,
         deadline: this.clock.setTimeout(() => {
           this.removeQueuedRoot(entry);
           const waitedMs = this.clock.now().getTime() - queuedAt;
@@ -1308,7 +1317,7 @@ export class ActionEngine {
             new ActionWorkerCapacityError(
               this.maxWorkerProcesses,
               waitedMs,
-              this.memoryHeld ? "memory" : "workers",
+              entry.heldByMemory ? "memory" : "workers",
             ),
           );
         }, this.queuedRootMaxWaitMs),
@@ -1322,7 +1331,7 @@ export class ActionEngine {
         liveWorkers: this.liveWorkers.size,
         heldBy: this.memoryHeld ? "memory" : "workers",
       });
-      if (this.memoryHeld) this.scheduleQueueRecheck();
+      if (this.memoryHeld || this.memoryPaced) this.scheduleQueueRecheck();
     });
   }
 
@@ -1355,6 +1364,14 @@ export class ActionEngine {
       workers: this.describeLiveWorkers(),
     });
     return false;
+  }
+
+  /** Whether a paced admission happened less than one recheck ago. */
+  private insidePacingWindow(): boolean {
+    return (
+      this.lastPacedAdmitAt !== null &&
+      this.clock.now().getTime() - this.lastPacedAdmitAt < QUEUE_MEMORY_RECHECK_MS
+    );
   }
 
   /** Re-runs admission after QUEUE_MEMORY_RECHECK_MS. One timer at a time. */
@@ -1391,7 +1408,12 @@ export class ActionEngine {
    * the start, and after a hold it admits one root per recheck. */
   private admitQueuedRoots(): void {
     while (this.queuedRoots.length > 0 && this.canAdmitQueuedRoot()) {
+      if (this.memoryPaced && this.insidePacingWindow()) {
+        this.scheduleQueueRecheck();
+        return;
+      }
       if (!this.memoryAllowsAdmission()) {
+        for (const waiting of this.queuedRoots) waiting.heldByMemory = true;
         this.scheduleQueueRecheck();
         return;
       }
@@ -1410,13 +1432,17 @@ export class ActionEngine {
         queueDepth: this.queuedRoots.length,
       });
       entry.admit(worker);
-      if (this.memoryPaced && this.queuedRoots.length > 0) {
-        this.scheduleQueueRecheck();
-        return;
+      if (this.memoryPaced) {
+        this.lastPacedAdmitAt = this.clock.now().getTime();
+        if (this.queuedRoots.length > 0) {
+          this.scheduleQueueRecheck();
+          return;
+        }
       }
     }
     if (this.queuedRoots.length === 0) {
       this.memoryPaced = false;
+      this.lastPacedAdmitAt = null;
       if (this.queueRecheckTimer) {
         this.clock.clearTimeout(this.queueRecheckTimer);
         this.queueRecheckTimer = null;

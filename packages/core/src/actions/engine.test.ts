@@ -710,6 +710,32 @@ describe("ActionEngine", () => {
         expect(actionWorkerFork).toHaveBeenCalledTimes(3);
       });
 
+      it("keeps pacing when a worker exits inside the recheck window", async () => {
+        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(5, 0.1);
+
+        const runs = [
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+        ];
+        for (const run of runs) run.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        memory.state.available = 0.9;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+
+        // The admitted root finishes at once. Its worker exit opens a slot, but
+        // the next admission still waits for the recheck.
+        children[0].completeNext();
+        await runs[0];
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+      });
+
       it("names memory as the reason when a held root times out", async () => {
         const { engine, actionWorkerFork, clock } = createGatedEngine(8, 0.1);
 
@@ -722,6 +748,28 @@ describe("ActionEngine", () => {
           message: expect.stringContaining("short on memory"),
         });
         expect(actionWorkerFork).not.toHaveBeenCalled();
+      });
+
+      it("names workers, not memory, when a root that only waited for a slot times out", async () => {
+        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(1, 0.9);
+
+        const blocker = engine.run("root", {});
+        await rs.waitFor(() => expect(children).toHaveLength(1));
+        const outcome = engine.run("root", {}, queue).catch((err: unknown) => err);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+
+        // Memory drops while the slot stays full; the queue never asked the gate
+        // about this root, so a hold is not why it waited.
+        memory.state.available = 0.05;
+        await clock.advance(60_000);
+        await expect(outcome).resolves.toMatchObject({
+          name: "ActionWorkerCapacityError",
+          message: expect.stringContaining("without a free worker"),
+        });
+
+        children[0].completeNext();
+        await blocker;
       });
 
       it("admits normally when memory cannot be read", async () => {
