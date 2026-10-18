@@ -10,6 +10,7 @@ import {
 import { actionExecutionContext } from "./context.js";
 import { hashArgs, replayContext, type JournalEntry } from "./replay.js";
 import { ActionRegistryImpl } from "./registry.js";
+import type { MemoryHeadroom } from "./memory-headroom.js";
 import type { Action, ActionResult } from "./types.js";
 import { callAction } from "./call-action.js";
 import { emitAgentMessage, type ActionRuntimeEvent } from "./runtime-events.js";
@@ -415,6 +416,8 @@ describe("ActionEngine", () => {
           queuedRootMaxWaitMs: 60_000,
           actionWorkerFork,
           clock,
+          // The host running the tests has no say over the queue.
+          memoryHeadroom: () => null,
         });
         return { engine, children, actionWorkerFork, clock };
       }
@@ -593,6 +596,141 @@ describe("ActionEngine", () => {
 
         children[0].completeNext();
         await blocker;
+      });
+    });
+    describe("memory pressure", () => {
+      const queue: ActionRunContext = { whenWorkersBusy: "queue" };
+      const limitBytes = 4 * 1024 ** 3;
+
+      /** A memory reading the test moves by setting `available`, as a fraction of the limit. */
+      function fakeHeadroom(available: number | null) {
+        const state = { available };
+        const read = (): MemoryHeadroom | null =>
+          state.available === null
+            ? null
+            : {
+                source: "cgroup-v2",
+                limitBytes,
+                availableBytes: Math.round(limitBytes * state.available),
+              };
+        return { state, read };
+      }
+
+      function createGatedEngine(maxWorkerProcesses: number, available: number | null) {
+        const registry = new ActionRegistryImpl();
+        registry.register(buildAction("root"));
+        const { children, actionWorkerFork } = installFakeChildProcessFactory({
+          autoRespond: false,
+        });
+        const clock = new FakeClock();
+        const memory = fakeHeadroom(available);
+        const engine = new ActionEngine(registry, createActionEngineRepos(), {
+          processRole: "main",
+          workerWarmPoolSize: 0,
+          maxWorkerProcesses,
+          queuedRootMaxWaitMs: 60_000,
+          actionWorkerFork,
+          clock,
+          memoryHeadroom: memory.read,
+        });
+        return { engine, children, actionWorkerFork, clock, memory };
+      }
+
+      it("holds a queued root while memory is short and admits it once memory recovers", async () => {
+        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(8, 0.1);
+
+        const queued = engine.run("root", {}, queue);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+
+        await clock.advance(5_000);
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+
+        memory.state.available = 0.5;
+        await clock.advance(5_000);
+        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
+        children[0].completeNext();
+        await expect(queued).resolves.toEqual({ status: "ok", data: "root" });
+      });
+
+      it("keeps holding between the hold and resume lines until memory clears the resume line", async () => {
+        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(8, 0.1);
+
+        const queued = engine.run("root", {}, queue);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        memory.state.available = 0.2;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+
+        memory.state.available = 0.3;
+        await clock.advance(5_000);
+        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
+        children[0].completeNext();
+        await queued;
+      });
+
+      it("admits at once when memory sits between the lines and no hold is in force", async () => {
+        const { engine, actionWorkerFork, children } = createGatedEngine(8, 0.2);
+
+        const queued = engine.run("root", {}, queue);
+        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
+        children[0].completeNext();
+        await queued;
+      });
+
+      it("never holds a fail-fast root", async () => {
+        const { engine, actionWorkerFork, children } = createGatedEngine(8, 0.05);
+
+        const run = engine.run("root", {});
+        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
+        children[0].completeNext();
+        await expect(run).resolves.toEqual({ status: "ok", data: "root" });
+      });
+
+      it("admits one queued root per recheck after a hold", async () => {
+        // Cap 5 leaves three slots to queued roots.
+        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
+
+        const runs = [
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+        ];
+        for (const run of runs) run.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+
+        memory.state.available = 0.9;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
+      });
+
+      it("names memory as the reason when a held root times out", async () => {
+        const { engine, actionWorkerFork, clock } = createGatedEngine(8, 0.1);
+
+        const outcome = engine.run("root", {}, queue).catch((err: unknown) => err);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        await clock.advance(60_000);
+        await expect(outcome).resolves.toMatchObject({
+          name: "ActionWorkerCapacityError",
+          message: expect.stringContaining("short on memory"),
+        });
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+      });
+
+      it("admits normally when memory cannot be read", async () => {
+        const { engine, actionWorkerFork, children } = createGatedEngine(8, null);
+
+        const queued = engine.run("root", {}, queue);
+        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
+        children[0].completeNext();
+        await queued;
       });
     });
   });

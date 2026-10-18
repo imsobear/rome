@@ -64,3 +64,20 @@ Alternatives rejected for this amendment:
 - **Raise the cap.** Rejected because a burst of long agent roots fills any fixed cap, and the cap exists to bound memory on the smallest instance.
 
 This amends the consequence that reaching the cap fails the call immediately. Future diffs must respect: a caller opts into queueing only when it holds no worker and no worker waits on it synchronously, and the queue never admits a root into a reserved slot.
+
+## Amendment (2026-10-18): a queued root also waits for memory
+
+The queue above admits on slot count alone. On the smallest instance, memory runs out before slots do. A few builds and test runs push the container into swap, the core stops answering health checks, and every running task is interrupted. Slots count processes, not bytes: eight light lookups fit where two builds do not.
+
+A queued root starts only when the container also has memory headroom. Main reads the cgroup memory limit and usage each time a slot could go to a queued root, and counts reclaimable file cache as free. Available memory under 15% of the limit holds the queue. The queue resumes once available memory is back over 25%, so the gate does not flap around one value. A held queue re-reads memory every five seconds, because memory recovers without any worker exiting. After a hold, the queue admits one root per re-read until it drains, so each started root shows in the next reading before the following one starts. A root that waits out the deadline fails with the same capacity error, which names memory as the reason. Outside a container there is no limit to measure against, and the gate never holds.
+
+The gate applies only to roots that already queue. Fail-fast callers never see it, for the reason they never queue: their caller may hold a worker, and holding them would wait on the slot an ancestor occupies. Heavy work an agent starts inside a conversation turn therefore still starts at once.
+
+Alternatives rejected for this amendment:
+
+- **Estimate each task's memory**, from a declared class, measured history, or a model's prediction, and admit against the estimate. Rejected because estimates go stale and app authors do not maintain them, while a live reading of the instance costs nothing to keep right.
+- **Hold fail-fast roots under memory pressure too.** Rejected because a held tool call keeps its ancestor's worker open, and a full pool of turn-holding workers would then wait on each other, which is the deadlock the decision above exists to prevent.
+- **Read the host's free memory where no cgroup limit applies.** Rejected because the host's free-page count excludes reclaimable cache and reads as a few percent on a healthy desktop, so the gate would hold every queued routine in the Mac app.
+- **Lower the worker cap on small plans instead.** Rejected as a replacement because a cap still counts processes, not bytes. A cap sized to the plan remains a complement.
+
+Future diffs must respect: a queued root never starts while the memory gate holds, the gate reads the instance and never the task, and the gate reaches only callers that already queue.
