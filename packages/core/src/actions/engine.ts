@@ -1293,8 +1293,8 @@ export class ActionEngine {
   private waitForRootWorker(rootExecutionId: string): Promise<ActionWorkerProcess> {
     if (
       this.queuedRoots.length === 0 &&
+      !this.memoryPaced &&
       this.canAdmitQueuedRoot() &&
-      !(this.memoryPaced && this.insidePacingWindow()) &&
       this.memoryAllowsAdmission()
     ) {
       return Promise.resolve(this.checkoutWorker(true));
@@ -1304,7 +1304,7 @@ export class ActionEngine {
       const entry: QueuedRoot = {
         rootExecutionId,
         queuedAt,
-        heldByMemory: this.memoryHeld,
+        heldByMemory: false,
         deadline: this.clock.setTimeout(() => {
           this.removeQueuedRoot(entry);
           const waitedMs = this.clock.now().getTime() - queuedAt;
@@ -1331,7 +1331,9 @@ export class ActionEngine {
         liveWorkers: this.liveWorkers.size,
         heldBy: this.memoryHeld ? "memory" : "workers",
       });
-      if (this.memoryHeld || this.memoryPaced) this.scheduleQueueRecheck();
+      // While paced, the admit loop owns every start, so it keeps the one-per-
+      // recheck rhythm and stamps the reason this root waits.
+      if (this.memoryPaced) this.admitQueuedRoots();
     });
   }
 
@@ -1343,7 +1345,12 @@ export class ActionEngine {
     if (!sample || !(sample.limitBytes > 0)) return true;
     const available = sample.availableBytes / sample.limitBytes;
     if (this.memoryHeld) {
-      if (available < MEMORY_RESUME_FRACTION) return false;
+      if (available < MEMORY_RESUME_FRACTION) {
+        // A hold that outlives a drained queue still paces the roots that
+        // arrive during it.
+        this.memoryPaced = true;
+        return false;
+      }
       this.memoryHeld = false;
       log.info("memory recovered; queued roots resume one per recheck", {
         availableMB: Math.round(sample.availableBytes / 1_048_576),

@@ -555,6 +555,7 @@ describe("ActionEngine", () => {
           maxWorkerProcesses: 1,
           actionWorkerFork,
           clock: new FakeClock(),
+          memoryHeadroom: () => null,
         });
 
         // The starting warm worker fills the cap, so the root waits for it
@@ -732,6 +733,59 @@ describe("ActionEngine", () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(actionWorkerFork).toHaveBeenCalledTimes(1);
 
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+      });
+
+      it("paces a hold that outlives a queue drained by timeout", async () => {
+        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
+
+        const first = engine.run("root", {}, queue).catch((err: unknown) => err);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await clock.advance(60_000);
+        await expect(first).resolves.toMatchObject({ name: "ActionWorkerCapacityError" });
+
+        // Memory stays short; the backlog arrives into the leftover hold.
+        const runs = [
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+        ];
+        for (const run of runs) run.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+
+        memory.state.available = 0.9;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+      });
+
+      it("paces a hold that outlives a queue drained by cancel", async () => {
+        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
+
+        const first = engine
+          .run("root", {}, { ...queue, executionId: "held-root" })
+          .catch((err: unknown) => err);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        await expect(engine.cancel("held-root")).resolves.toBe(true);
+        await expect(first).resolves.toMatchObject({ name: "ActionCancelledError" });
+        // The recheck finds an empty queue while the hold is still in force.
+        await clock.advance(5_000);
+
+        const runs = [
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+        ];
+        for (const run of runs) run.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).not.toHaveBeenCalled();
+
+        memory.state.available = 0.9;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
         await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(2);
       });
