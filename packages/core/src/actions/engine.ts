@@ -364,15 +364,6 @@ export class ActionEngine {
   /** True while the memory gate holds the queue. Cleared once headroom climbs
    * back over the resume line. */
   private memoryHeld = false;
-  /** True from a hold until a reading taken one recheck after a paced
-   * admission is back over the resume line. Admissions then go one per
-   * recheck, so each admitted root shows up in the next reading before the
-   * following one starts. An empty queue does not end it: the next arrival
-   * takes the admit loop and its reading decides. */
-  private memoryPaced = false;
-  /** When the last paced admission happened. Slot-open events inside the
-   * recheck window admit nothing; the timer takes the next one. */
-  private lastPacedAdmitAt: number | null = null;
   private queueRecheckTimer: ClockTimer | null = null;
   private workerWarmPoolStarted = false;
   private workerPoolGeneration = 0;
@@ -1295,7 +1286,6 @@ export class ActionEngine {
   private waitForRootWorker(rootExecutionId: string): Promise<ActionWorkerProcess> {
     if (
       this.queuedRoots.length === 0 &&
-      !this.memoryPaced &&
       this.canAdmitQueuedRoot() &&
       this.memoryAllowsAdmission()
     ) {
@@ -1333,9 +1323,7 @@ export class ActionEngine {
         liveWorkers: this.liveWorkers.size,
         heldBy: this.memoryHeld ? "memory" : "workers",
       });
-      // While paced, the admit loop owns every start, so it keeps the one-per-
-      // recheck rhythm and stamps the reason this root waits.
-      if (this.memoryPaced) this.admitQueuedRoots();
+      if (this.memoryHeld) this.scheduleQueueRecheck();
     });
   }
 
@@ -1349,7 +1337,7 @@ export class ActionEngine {
     if (this.memoryHeld) {
       if (available < MEMORY_RESUME_FRACTION) return false;
       this.memoryHeld = false;
-      log.info("memory recovered; queued roots resume one per recheck", {
+      log.info("memory recovered; queued roots resume", {
         availableMB: Math.round(sample.availableBytes / 1_048_576),
         limitMB: Math.round(sample.limitBytes / 1_048_576),
         source: sample.source,
@@ -1357,26 +1345,8 @@ export class ActionEngine {
       });
       return true;
     }
-    if (available >= MEMORY_HOLD_FRACTION) {
-      if (
-        this.memoryPaced &&
-        this.lastPacedAdmitAt !== null &&
-        !this.insidePacingWindow() &&
-        available >= MEMORY_RESUME_FRACTION
-      ) {
-        // The last paced root has had a full recheck to show up in the
-        // reading, and memory is still healthy: no reason to keep pacing.
-        this.memoryPaced = false;
-        this.lastPacedAdmitAt = null;
-        log.info("memory steady after a paced start; queued roots resume at full rate", {
-          availableMB: Math.round(sample.availableBytes / 1_048_576),
-          queueDepth: this.queuedRoots.length,
-        });
-      }
-      return true;
-    }
+    if (available >= MEMORY_HOLD_FRACTION) return true;
     this.memoryHeld = true;
-    this.memoryPaced = true;
     log.warn("instance short on memory; holding queued roots", {
       availableMB: Math.round(sample.availableBytes / 1_048_576),
       limitMB: Math.round(sample.limitBytes / 1_048_576),
@@ -1385,14 +1355,6 @@ export class ActionEngine {
       workers: this.describeLiveWorkers(),
     });
     return false;
-  }
-
-  /** Whether a paced admission happened less than one recheck ago. */
-  private insidePacingWindow(): boolean {
-    return (
-      this.lastPacedAdmitAt !== null &&
-      this.clock.now().getTime() - this.lastPacedAdmitAt < QUEUE_MEMORY_RECHECK_MS
-    );
   }
 
   /** Re-runs admission after QUEUE_MEMORY_RECHECK_MS. One timer at a time. */
@@ -1426,14 +1388,9 @@ export class ActionEngine {
    * worker exits, a worker returns to the warm pool, or a warm worker becomes
    * ready. Runs before the warm pool refills, so a queued root outranks a new
    * idle worker. A slot alone is not enough: the memory gate must also allow
-   * the start, and after a hold it admits one root per recheck until a
-   * recheck shows memory steady. */
+   * the start, and it is asked again for every root. */
   private admitQueuedRoots(): void {
     while (this.queuedRoots.length > 0 && this.canAdmitQueuedRoot()) {
-      if (this.memoryPaced && this.insidePacingWindow()) {
-        this.scheduleQueueRecheck();
-        return;
-      }
       if (!this.memoryAllowsAdmission()) {
         for (const waiting of this.queuedRoots) waiting.heldByMemory = true;
         this.scheduleQueueRecheck();
@@ -1454,13 +1411,6 @@ export class ActionEngine {
         queueDepth: this.queuedRoots.length,
       });
       entry.admit(worker);
-      if (this.memoryPaced) {
-        this.lastPacedAdmitAt = this.clock.now().getTime();
-        if (this.queuedRoots.length > 0) {
-          this.scheduleQueueRecheck();
-          return;
-        }
-      }
     }
     if (this.queuedRoots.length === 0 && this.queueRecheckTimer) {
       this.clock.clearTimeout(this.queueRecheckTimer);

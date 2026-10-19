@@ -689,11 +689,12 @@ describe("ActionEngine", () => {
         await expect(run).resolves.toEqual({ status: "ok", data: "root" });
       });
 
-      it("admits one root after a hold, then the rest once a recheck shows memory steady", async () => {
+      it("admits every queued root the slots allow once memory recovers", async () => {
         // Cap 5 leaves three slots to queued roots.
-        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(5, 0.1);
+        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
 
         const runs = [
+          engine.run("root", {}, queue),
           engine.run("root", {}, queue),
           engine.run("root", {}, queue),
           engine.run("root", {}, queue),
@@ -704,90 +705,10 @@ describe("ActionEngine", () => {
 
         memory.state.available = 0.9;
         await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
-
-        // Pacing is over: a new root starts at once, even while the others run.
-        children[0].completeNext();
-        await runs[0];
-        const late = engine.run("root", {}, queue);
-        late.catch(() => {});
-        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(4));
-      });
-
-      it("paces a root that arrives inside the window after the sole held root started", async () => {
-        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
-
-        const held = engine.run("root", {}, queue);
-        held.catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 0));
-
-        memory.state.available = 0.9;
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-
-        // The queue is empty, but the started root has not shown in a reading
-        // yet, so a newcomer waits for the recheck.
-        const next = engine.run("root", {}, queue);
-        next.catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
-      });
-
-      it("keeps pacing while the reading after a paced start is under the resume line", async () => {
-        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
-
-        const runs = [
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-        ];
-        for (const run of runs) run.catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 0));
-
-        memory.state.available = 0.9;
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-
-        // The started root ate into memory: between the lines, so still paced.
-        memory.state.available = 0.2;
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
-        await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(3);
       });
 
-      it("keeps pacing when a worker exits inside the recheck window", async () => {
-        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(5, 0.1);
-
-        const runs = [
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-        ];
-        for (const run of runs) run.catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 0));
-
-        memory.state.available = 0.9;
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-
-        // The admitted root finishes at once. Its worker exit opens a slot, but
-        // the next admission still waits for the recheck.
-        children[0].completeNext();
-        await runs[0];
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
-      });
-
-      it("paces a hold that outlives a queue drained by timeout", async () => {
+      it("keeps holding roots that arrive after a timeout drained the queue", async () => {
         const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
 
         const first = engine.run("root", {}, queue).catch((err: unknown) => err);
@@ -795,49 +716,15 @@ describe("ActionEngine", () => {
         await clock.advance(60_000);
         await expect(first).resolves.toMatchObject({ name: "ActionWorkerCapacityError" });
 
-        // Memory stays short; the backlog arrives into the leftover hold.
-        const runs = [
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-        ];
-        for (const run of runs) run.catch(() => {});
+        const second = engine.run("root", {}, queue);
+        second.catch(() => {});
         await new Promise((resolve) => setTimeout(resolve, 0));
+        await clock.advance(5_000);
         expect(actionWorkerFork).not.toHaveBeenCalled();
 
         memory.state.available = 0.9;
         await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
-      });
-
-      it("paces a hold that outlives a queue drained by cancel", async () => {
-        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
-
-        const first = engine
-          .run("root", {}, { ...queue, executionId: "held-root" })
-          .catch((err: unknown) => err);
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        await expect(engine.cancel("held-root")).resolves.toBe(true);
-        await expect(first).resolves.toMatchObject({ name: "ActionCancelledError" });
-        // The recheck finds an empty queue while the hold is still in force.
-        await clock.advance(5_000);
-
-        const runs = [
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-          engine.run("root", {}, queue),
-        ];
-        for (const run of runs) run.catch(() => {});
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        expect(actionWorkerFork).not.toHaveBeenCalled();
-
-        memory.state.available = 0.9;
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
-        await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
       });
 
       it("names memory as the reason when a held root times out", async () => {
