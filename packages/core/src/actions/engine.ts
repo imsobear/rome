@@ -33,7 +33,7 @@ import {
   type ActionWorkerPayload,
   type ActionWorkerShutdown,
 } from "./worker-protocol.js";
-import { readMemoryHeadroom, type MemoryHeadroomReader } from "./memory-headroom.js";
+import type { MemoryHeadroomReader } from "./memory-headroom.js";
 import {
   normalizeActionEvent,
   type ActionInvocationObserver,
@@ -115,14 +115,18 @@ const DEFAULT_QUEUED_ROOT_MAX_WAIT_MS = 10 * 60_000;
  * caller often holds a worker of its own and cannot wait for one. */
 const RESERVED_WORKER_SLOTS = 2;
 /** A queued root starts only while the instance's available memory is at least
- * this share of its limit. One line, no latch: every start is judged against a
- * fresh reading, so a root that eats the headroom stops the next one and a
- * root that frees it lets the next one go. Fail-fast callers never see the
- * gate: their caller may hold a worker and cannot wait. */
+ * this share of its limit. One line, no latch: each start is judged against a
+ * reading taken just before it, so a started root stops the next start once
+ * its usage shows in a later reading, and a finished root lets the next one go.
+ * Roots admitted on one reading start together. Fail-fast callers never see
+ * the gate: their caller may hold a worker and cannot wait. */
 const MEMORY_HOLD_FRACTION = 0.15;
 /** How often a held queue re-reads memory. Memory can recover without any
  * worker exiting, so the queue cannot rely on slot changes alone. */
 const QUEUE_MEMORY_RECHECK_MS = 5_000;
+/** A reading that hovers at the line crosses it on many rechecks. The gate logs
+ * a crossing at most this often, so a long hold costs two lines, not hundreds. */
+const MEMORY_LOG_INTERVAL_MS = 60_000;
 
 export interface ActionRunContext {
   initiator?: string;
@@ -207,9 +211,10 @@ interface ActionEngineOptions {
    * {@link ActionWorkerCapacityError}. Defaults to ten minutes. */
   queuedRootMaxWaitMs?: number;
   /** Reads the instance's memory headroom when a queued root could take a
-   * worker. Defaults to the cgroup limit, then Linux's `/proc/meminfo`, which
-   * the Mac app reads inside its Lima VM. Where neither exists the gate never
-   * holds. Tests inject a controllable reading. */
+   * worker. The default reads nothing, so an engine built without it never
+   * holds the queue; the production wiring passes `readMemoryHeadroom`, which
+   * reads the cgroup limit, then Linux's `/proc/meminfo` (the Mac app reads
+   * its Lima VM's). Tests inject a controllable reading. */
   memoryHeadroom?: MemoryHeadroomReader;
   /**
    * Number of already-initialized action workers to keep ready in the main
@@ -364,6 +369,8 @@ export class ActionEngine {
   /** Whether the last reading was short. Steers the log lines only, so a long
    * hold logs its start and its end rather than every recheck. */
   private memoryShort = false;
+  /** When the gate last logged a crossing of the line. */
+  private memoryLoggedAt: number | null = null;
   private queueRecheckTimer: ClockTimer | null = null;
   private workerWarmPoolStarted = false;
   private workerPoolGeneration = 0;
@@ -398,7 +405,17 @@ export class ActionEngine {
         ? Math.max(1, Math.floor(options?.maxWorkerProcesses ?? Number.POSITIVE_INFINITY))
         : 0;
     this.queuedRootMaxWaitMs = options?.queuedRootMaxWaitMs ?? DEFAULT_QUEUED_ROOT_MAX_WAIT_MS;
-    this.memoryHeadroom = options?.memoryHeadroom ?? readMemoryHeadroom;
+    this.memoryHeadroom = options?.memoryHeadroom ?? (() => null);
+    if (this.processRole === "main") {
+      // One line at boot says which reading the gate will trust, so a wrong
+      // source on a new kind of host shows up without waiting for a hold.
+      const sample = this.memoryHeadroom();
+      log.info("memory gate reading", {
+        source: sample?.source ?? "none",
+        limitMB: sample ? Math.round(sample.limitBytes / 1_048_576) : null,
+        availableMB: sample ? Math.round(sample.availableBytes / 1_048_576) : null,
+      });
+    }
   }
 
   setWorkerRpcServer(server: WorkerRpcServer | null): void {
@@ -1338,28 +1355,24 @@ export class ActionEngine {
     const sample = this.memoryHeadroom();
     if (!sample || !(sample.limitBytes > 0)) return true;
     const available = sample.availableBytes / sample.limitBytes;
-    if (available >= MEMORY_HOLD_FRACTION) {
-      if (this.memoryShort) {
-        this.memoryShort = false;
-        log.info("memory recovered; queued roots resume", {
+    const short = available < MEMORY_HOLD_FRACTION;
+    if (short !== this.memoryShort) {
+      this.memoryShort = short;
+      const now = this.clock.now().getTime();
+      if (this.memoryLoggedAt === null || now - this.memoryLoggedAt >= MEMORY_LOG_INTERVAL_MS) {
+        this.memoryLoggedAt = now;
+        const fields = {
           availableMB: Math.round(sample.availableBytes / 1_048_576),
           limitMB: Math.round(sample.limitBytes / 1_048_576),
           source: sample.source,
           queueDepth: this.queuedRoots.length,
-        });
+          liveWorkers: this.liveWorkers.size,
+        };
+        if (short) log.warn("instance short on memory; holding queued roots", fields);
+        else log.info("memory recovered; queued roots resume", fields);
       }
-      return true;
     }
-    if (this.memoryShort) return false;
-    this.memoryShort = true;
-    log.warn("instance short on memory; holding queued roots", {
-      availableMB: Math.round(sample.availableBytes / 1_048_576),
-      limitMB: Math.round(sample.limitBytes / 1_048_576),
-      source: sample.source,
-      queueDepth: this.queuedRoots.length,
-      workers: this.describeLiveWorkers(),
-    });
-    return false;
+    return !short;
   }
 
   /** Re-runs admission after QUEUE_MEMORY_RECHECK_MS. One timer at a time. */
