@@ -207,9 +207,9 @@ interface ActionEngineOptions {
    * {@link ActionWorkerCapacityError}. Defaults to ten minutes. */
   queuedRootMaxWaitMs?: number;
   /** Reads the instance's memory headroom when a queued root could take a
-   * worker. Defaults to the cgroup limit, then Linux's `/proc/meminfo`; where
-   * neither exists (the Mac app) the gate never holds. Tests inject a
-   * controllable reading. */
+   * worker. Defaults to the cgroup limit, then Linux's `/proc/meminfo`, which
+   * the Mac app reads inside its Lima VM. Where neither exists the gate never
+   * holds. Tests inject a controllable reading. */
   memoryHeadroom?: MemoryHeadroomReader;
   /**
    * Number of already-initialized action workers to keep ready in the main
@@ -364,9 +364,10 @@ export class ActionEngine {
   /** True while the memory gate holds the queue. Cleared once headroom climbs
    * back over the resume line. */
   private memoryHeld = false;
-  /** True from the first hold until the queue drains: admissions then go one
-   * per recheck, so each admitted root shows up in the next reading before the
-   * following one starts. */
+  /** True from a hold until a reading taken one recheck after a paced
+   * admission is back over the resume line. Admissions then go one per
+   * recheck, so each admitted root shows up in the next reading before the
+   * following one starts. A drained queue ends pacing too. */
   private memoryPaced = false;
   /** When the last paced admission happened. Slot-open events inside the
    * recheck window admit nothing; the timer takes the next one. */
@@ -1360,7 +1361,24 @@ export class ActionEngine {
       });
       return true;
     }
-    if (available >= MEMORY_HOLD_FRACTION) return true;
+    if (available >= MEMORY_HOLD_FRACTION) {
+      if (
+        this.memoryPaced &&
+        this.lastPacedAdmitAt !== null &&
+        !this.insidePacingWindow() &&
+        available >= MEMORY_RESUME_FRACTION
+      ) {
+        // The last paced root has had a full recheck to show up in the
+        // reading, and memory is still healthy: no reason to keep pacing.
+        this.memoryPaced = false;
+        this.lastPacedAdmitAt = null;
+        log.info("memory steady after a paced start; queued roots resume at full rate", {
+          availableMB: Math.round(sample.availableBytes / 1_048_576),
+          queueDepth: this.queuedRoots.length,
+        });
+      }
+      return true;
+    }
     this.memoryHeld = true;
     this.memoryPaced = true;
     log.warn("instance short on memory; holding queued roots", {
@@ -1412,7 +1430,8 @@ export class ActionEngine {
    * worker exits, a worker returns to the warm pool, or a warm worker becomes
    * ready. Runs before the warm pool refills, so a queued root outranks a new
    * idle worker. A slot alone is not enough: the memory gate must also allow
-   * the start, and after a hold it admits one root per recheck. */
+   * the start, and after a hold it admits one root per recheck until a
+   * recheck shows memory steady. */
   private admitQueuedRoots(): void {
     while (this.queuedRoots.length > 0 && this.canAdmitQueuedRoot()) {
       if (this.memoryPaced && this.insidePacingWindow()) {

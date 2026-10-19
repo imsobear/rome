@@ -689,9 +689,9 @@ describe("ActionEngine", () => {
         await expect(run).resolves.toEqual({ status: "ok", data: "root" });
       });
 
-      it("admits one queued root per recheck after a hold", async () => {
+      it("admits one root after a hold, then the rest once a recheck shows memory steady", async () => {
         // Cap 5 leaves three slots to queued roots.
-        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
+        const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(5, 0.1);
 
         const runs = [
           engine.run("root", {}, queue),
@@ -705,6 +705,34 @@ describe("ActionEngine", () => {
         memory.state.available = 0.9;
         await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
+
+        // Pacing is over: a new root starts at once, even while the others run.
+        children[0].completeNext();
+        await runs[0];
+        const late = engine.run("root", {}, queue);
+        late.catch(() => {});
+        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(4));
+      });
+
+      it("keeps pacing while the reading after a paced start is under the resume line", async () => {
+        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
+
+        const runs = [
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+          engine.run("root", {}, queue),
+        ];
+        for (const run of runs) run.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        memory.state.available = 0.9;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+
+        // The started root ate into memory: between the lines, so still paced.
+        memory.state.available = 0.2;
         await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(2);
         await clock.advance(5_000);
@@ -734,7 +762,7 @@ describe("ActionEngine", () => {
         expect(actionWorkerFork).toHaveBeenCalledTimes(1);
 
         await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
       });
 
       it("paces a hold that outlives a queue drained by timeout", async () => {
@@ -759,7 +787,7 @@ describe("ActionEngine", () => {
         await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(1);
         await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
       });
 
       it("paces a hold that outlives a queue drained by cancel", async () => {
@@ -787,7 +815,7 @@ describe("ActionEngine", () => {
         await clock.advance(5_000);
         expect(actionWorkerFork).toHaveBeenCalledTimes(1);
         await clock.advance(5_000);
-        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(3);
       });
 
       it("names memory as the reason when a held root times out", async () => {
