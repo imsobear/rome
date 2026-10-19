@@ -10,25 +10,31 @@ function Box({ value }: { value: string }) {
 afterEach(cleanup);
 
 describe("useComposedInput", () => {
-  it("keeps the draft when its own earlier write arrives late", () => {
+  it("holds a composition until the value catches up, then follows the value", () => {
+    const { rerender } = render(<Box value="" />);
+    const box = screen.getByLabelText("box") as HTMLInputElement;
+
+    fireEvent.input(box, { target: { value: "shoushi" }, isComposing: true });
+    expect(box.value).toBe("shoushi");
+
+    fireEvent.input(box, { target: { value: "收拾" }, isComposing: true });
+    fireEvent.compositionEnd(box);
+    expect(box.value).toBe("收拾");
+
+    rerender(<Box value="收拾" />);
+    rerender(<Box value="nadia" />);
+    expect(box.value).toBe("nadia");
+  });
+
+  it("follows back after repeated drafts", () => {
     const { rerender } = render(<Box value="" />);
     const box = screen.getByLabelText("box") as HTMLInputElement;
 
     fireEvent.input(box, { target: { value: "a" } });
     fireEvent.input(box, { target: { value: "ab" } });
+    fireEvent.input(box, { target: { value: "a" } });
     rerender(<Box value="a" />);
-    expect(box.value).toBe("ab");
-
     rerender(<Box value="ab" />);
     expect(box.value).toBe("ab");
-  });
-
-  it("follows a value that changed from outside", () => {
-    const { rerender } = render(<Box value="" />);
-    const box = screen.getByLabelText("box") as HTMLInputElement;
-
-    fireEvent.input(box, { target: { value: "a" } });
-    rerender(<Box value="nadia" />);
-    expect(box.value).toBe("nadia");
   });
 });
