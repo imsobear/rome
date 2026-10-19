@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
 import { Navigate, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { CircleAlert, RefreshCw } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useComposedInput } from "@/hooks/use-composed-input";
 import { FilterChipGroup } from "@/components/ui/filter-chip-group";
 import { SegmentedControl } from "@/components/ui/segmented-control";
 import { List } from "@/components/ui/list-row";
@@ -56,7 +57,7 @@ import { usePeopleRoster } from "./people/use-roster";
  *
  * Both views are routes — `/people/latest` and `/people/directory` — and the
  * chip and the search term ride the query beside them. The page holds no
- * control state of its own beyond the search box's draft: what is on screen is what the address says, so a
+ * control state of its own: what is on screen is what the address says, so a
  * view is linkable, a reload returns to it, and back steps through the choices
  * that got there.
  *
@@ -70,64 +71,6 @@ import { usePeopleRoster } from "./people/use-roster";
  *  person row actually holds. Unknown and Stranger are account states, and the
  *  account read is narrowed by those instead. */
 const PLACED_FILTERS = new Set<PeopleFilter>(["inner-circle", "acquaintance", "other"]);
-
-/**
- * The search box, which holds a draft of the term the address names.
- *
- * The address cannot be the box's only copy. An input method composes a word
- * out of keystrokes inside the box, and a navigation per keystroke re-renders
- * the box mid-word and throws the composition away, which leaves the raw
- * pinyin behind instead of the characters. So the box keeps what is being
- * typed, and the address gets the term only once no composition is open.
- */
-function SearchBox({
-  value,
-  onCommit,
-  placeholder,
-  "aria-label": ariaLabel,
-}: {
-  value: string;
-  onCommit: (next: string) => void;
-  placeholder: string;
-  "aria-label": string;
-}) {
-  const [draft, setDraft] = useState(value);
-  const composing = useRef(false);
-  const committed = useRef(value);
-
-  // The address moved without the box (back, a link): follow it.
-  useEffect(() => {
-    if (value === committed.current) return;
-    committed.current = value;
-    if (!composing.current) setDraft(value);
-  }, [value]);
-
-  const commit = (next: string) => {
-    committed.current = next;
-    onCommit(next);
-  };
-
-  return (
-    <Input
-      type="search"
-      value={draft}
-      onChange={(e) => {
-        setDraft(e.target.value);
-        if (!composing.current) commit(e.target.value);
-      }}
-      onCompositionStart={() => {
-        composing.current = true;
-      }}
-      onCompositionEnd={(e) => {
-        composing.current = false;
-        commit(e.currentTarget.value);
-      }}
-      placeholder={placeholder}
-      aria-label={ariaLabel}
-      className="w-full sm:w-72"
-    />
-  );
-}
 
 /**
  * `/people` is the root the two views share and renders neither: it forwards to
@@ -167,6 +110,8 @@ export default function PeoplePage({ view }: { view: PeopleView }) {
       }),
       options,
     );
+
+  const searchInput = useComposedInput(search, (next) => go({ search: next }, { replace: true }));
 
   // The view picks the account read: the contacts list, or the recents surface.
   //
@@ -266,11 +211,12 @@ export default function PeoplePage({ view }: { view: PeopleView }) {
         />
 
         <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3">
-          <SearchBox
-            value={search}
-            onCommit={(next) => go({ search: next }, { replace: true })}
+          <Input
+            type="search"
+            {...searchInput}
             placeholder={t("search.placeholder")}
             aria-label={t("search.label")}
+            className="w-full sm:w-72"
           />
           <FilterChipGroup<PeopleFilter>
             aria-label={t("filters.groupLabel")}

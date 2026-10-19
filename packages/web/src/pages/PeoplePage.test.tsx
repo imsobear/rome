@@ -1123,13 +1123,12 @@ describe("PeoplePage puts its controls in the address", () => {
 
     await screen.findByText("Wei Chen");
     const box = searchBox();
-    fireEvent.compositionStart(box);
-    fireEvent.change(box, { target: { value: "shou" } });
-    fireEvent.change(box, { target: { value: "shoushi" } });
+    fireEvent.input(box, { target: { value: "shou" }, isComposing: true });
+    fireEvent.input(box, { target: { value: "shoushi" }, isComposing: true });
     expect(box.value).toBe("shoushi");
     expect(address()).toBe("/people/latest");
 
-    fireEvent.change(box, { target: { value: "收拾" } });
+    fireEvent.input(box, { target: { value: "收拾" }, isComposing: true });
     fireEvent.compositionEnd(box);
     await waitFor(() => expect(address()).toBe(`/people/latest?q=${encodeURIComponent("收拾")}`));
     expect(box.value).toBe("收拾");
