@@ -367,7 +367,8 @@ export class ActionEngine {
   /** True from a hold until a reading taken one recheck after a paced
    * admission is back over the resume line. Admissions then go one per
    * recheck, so each admitted root shows up in the next reading before the
-   * following one starts. A drained queue ends pacing too. */
+   * following one starts. An empty queue does not end it: the next arrival
+   * takes the admit loop and its reading decides. */
   private memoryPaced = false;
   /** When the last paced admission happened. Slot-open events inside the
    * recheck window admit nothing; the timer takes the next one. */
@@ -1346,12 +1347,7 @@ export class ActionEngine {
     if (!sample || !(sample.limitBytes > 0)) return true;
     const available = sample.availableBytes / sample.limitBytes;
     if (this.memoryHeld) {
-      if (available < MEMORY_RESUME_FRACTION) {
-        // A hold that outlives a drained queue still paces the roots that
-        // arrive during it.
-        this.memoryPaced = true;
-        return false;
-      }
+      if (available < MEMORY_RESUME_FRACTION) return false;
       this.memoryHeld = false;
       log.info("memory recovered; queued roots resume one per recheck", {
         availableMB: Math.round(sample.availableBytes / 1_048_576),
@@ -1466,13 +1462,9 @@ export class ActionEngine {
         }
       }
     }
-    if (this.queuedRoots.length === 0) {
-      this.memoryPaced = false;
-      this.lastPacedAdmitAt = null;
-      if (this.queueRecheckTimer) {
-        this.clock.clearTimeout(this.queueRecheckTimer);
-        this.queueRecheckTimer = null;
-      }
+    if (this.queuedRoots.length === 0 && this.queueRecheckTimer) {
+      this.clock.clearTimeout(this.queueRecheckTimer);
+      this.queueRecheckTimer = null;
     }
   }
 

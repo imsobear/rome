@@ -716,6 +716,28 @@ describe("ActionEngine", () => {
         await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(4));
       });
 
+      it("paces a root that arrives inside the window after the sole held root started", async () => {
+        const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
+
+        const held = engine.run("root", {}, queue);
+        held.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        memory.state.available = 0.9;
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+
+        // The queue is empty, but the started root has not shown in a reading
+        // yet, so a newcomer waits for the recheck.
+        const next = engine.run("root", {}, queue);
+        next.catch(() => {});
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(actionWorkerFork).toHaveBeenCalledTimes(1);
+
+        await clock.advance(5_000);
+        expect(actionWorkerFork).toHaveBeenCalledTimes(2);
+      });
+
       it("keeps pacing while the reading after a paced start is under the resume line", async () => {
         const { engine, actionWorkerFork, clock, memory } = createGatedEngine(5, 0.1);
 
