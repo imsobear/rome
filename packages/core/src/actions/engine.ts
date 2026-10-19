@@ -114,12 +114,12 @@ const DEFAULT_QUEUED_ROOT_MAX_WAIT_MS = 10 * 60_000;
  * callers — agent tool calls, nested delegations, interactive turns — whose
  * caller often holds a worker of its own and cannot wait for one. */
 const RESERVED_WORKER_SLOTS = 2;
-/** Queued roots stop while the instance's available memory is under this share
- * of its limit, and start again once it climbs back over the resume share. Two
- * lines keep the gate from flapping around one value. Fail-fast callers never
- * see the gate: their caller may hold a worker and cannot wait. */
+/** A queued root starts only while the instance's available memory is at least
+ * this share of its limit. One line, no latch: every start is judged against a
+ * fresh reading, so a root that eats the headroom stops the next one and a
+ * root that frees it lets the next one go. Fail-fast callers never see the
+ * gate: their caller may hold a worker and cannot wait. */
 const MEMORY_HOLD_FRACTION = 0.15;
-const MEMORY_RESUME_FRACTION = 0.25;
 /** How often a held queue re-reads memory. Memory can recover without any
  * worker exiting, so the queue cannot rely on slot changes alone. */
 const QUEUE_MEMORY_RECHECK_MS = 5_000;
@@ -361,9 +361,9 @@ export class ActionEngine {
   private queuedRootMaxWaitMs: number;
   private queuedRoots: QueuedRoot[] = [];
   private memoryHeadroom: MemoryHeadroomReader;
-  /** True while the memory gate holds the queue. Cleared once headroom climbs
-   * back over the resume line. */
-  private memoryHeld = false;
+  /** Whether the last reading was short. Steers the log lines only, so a long
+   * hold logs its start and its end rather than every recheck. */
+  private memoryShort = false;
   private queueRecheckTimer: ClockTimer | null = null;
   private workerWarmPoolStarted = false;
   private workerPoolGeneration = 0;
@@ -1317,13 +1317,17 @@ export class ActionEngine {
         reject,
       };
       this.queuedRoots.push(entry);
+      // A free slot with a waiting root means memory is what holds it.
+      if (this.canAdmitQueuedRoot()) {
+        entry.heldByMemory = true;
+        this.scheduleQueueRecheck();
+      }
       log.info("root queued for an action worker", {
         rootExecutionId,
         queueDepth: this.queuedRoots.length,
         liveWorkers: this.liveWorkers.size,
-        heldBy: this.memoryHeld ? "memory" : "workers",
+        heldBy: entry.heldByMemory ? "memory" : "workers",
       });
-      if (this.memoryHeld) this.scheduleQueueRecheck();
     });
   }
 
@@ -1334,19 +1338,20 @@ export class ActionEngine {
     const sample = this.memoryHeadroom();
     if (!sample || !(sample.limitBytes > 0)) return true;
     const available = sample.availableBytes / sample.limitBytes;
-    if (this.memoryHeld) {
-      if (available < MEMORY_RESUME_FRACTION) return false;
-      this.memoryHeld = false;
-      log.info("memory recovered; queued roots resume", {
-        availableMB: Math.round(sample.availableBytes / 1_048_576),
-        limitMB: Math.round(sample.limitBytes / 1_048_576),
-        source: sample.source,
-        queueDepth: this.queuedRoots.length,
-      });
+    if (available >= MEMORY_HOLD_FRACTION) {
+      if (this.memoryShort) {
+        this.memoryShort = false;
+        log.info("memory recovered; queued roots resume", {
+          availableMB: Math.round(sample.availableBytes / 1_048_576),
+          limitMB: Math.round(sample.limitBytes / 1_048_576),
+          source: sample.source,
+          queueDepth: this.queuedRoots.length,
+        });
+      }
       return true;
     }
-    if (available >= MEMORY_HOLD_FRACTION) return true;
-    this.memoryHeld = true;
+    if (this.memoryShort) return false;
+    this.memoryShort = true;
     log.warn("instance short on memory; holding queued roots", {
       availableMB: Math.round(sample.availableBytes / 1_048_576),
       limitMB: Math.round(sample.limitBytes / 1_048_576),

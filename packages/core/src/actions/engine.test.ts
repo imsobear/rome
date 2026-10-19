@@ -654,27 +654,16 @@ describe("ActionEngine", () => {
         await expect(queued).resolves.toEqual({ status: "ok", data: "root" });
       });
 
-      it("keeps holding between the hold and resume lines until memory clears the resume line", async () => {
+      it("admits as soon as a reading is back at the line, with no latch", async () => {
         const { engine, actionWorkerFork, clock, memory, children } = createGatedEngine(8, 0.1);
 
         const queued = engine.run("root", {}, queue);
         await new Promise((resolve) => setTimeout(resolve, 0));
-
-        memory.state.available = 0.2;
-        await clock.advance(5_000);
         expect(actionWorkerFork).not.toHaveBeenCalled();
 
-        memory.state.available = 0.3;
+        // Just over the line: rounding the fake reading keeps an exact 0.15 under it.
+        memory.state.available = 0.16;
         await clock.advance(5_000);
-        await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
-        children[0].completeNext();
-        await queued;
-      });
-
-      it("admits at once when memory sits between the lines and no hold is in force", async () => {
-        const { engine, actionWorkerFork, children } = createGatedEngine(8, 0.2);
-
-        const queued = engine.run("root", {}, queue);
         await rs.waitFor(() => expect(actionWorkerFork).toHaveBeenCalledTimes(1));
         children[0].completeNext();
         await queued;
