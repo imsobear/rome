@@ -226,6 +226,51 @@ describe("summon", () => {
     });
   });
 
+  it("names the summoned turn on the Rome session event once the turn has started", async () => {
+    const runner = {
+      async *run() {
+        yield {
+          type: "turn_start" as const,
+          turnId: "turn-001",
+          sessionId: "session-001",
+          userPrompt: "fix bug",
+        };
+        yield {
+          type: "session_init" as const,
+          sessionId: "session-001",
+          romeSession: { _romeSessionId: "action:exec-1:coder", _type: "action" },
+        };
+        yield { type: "result" as const, content: "done" };
+        yield {
+          type: "turn_end" as const,
+          turnId: "turn-001",
+          status: "completed" as const,
+          durationMs: 5,
+        };
+      },
+    } as unknown as AgentRunner;
+    const tool = createSummonAction(actionConfig, summonDeps(runner));
+    const events: unknown[] = [];
+
+    await tool.execute(
+      { agentName: "coder", prompt: "fix bug" },
+      {
+        emitActionEvent(event) {
+          events.push(event);
+        },
+      },
+    );
+
+    expect(events).toEqual([
+      {
+        type: "rome_session_started",
+        agentName: "coder",
+        romeSession: { _romeSessionId: "action:exec-1:coder", _type: "action" },
+        turnId: "turn-001",
+      },
+    ]);
+  });
+
   it("forwards summoned agent trace messages to the active runtime observer", async () => {
     // turn_start/turn_end bracket the summoned stream and must stay local to
     // summon (not forwarded) — only session_init + content reach the observer.

@@ -5519,6 +5519,7 @@ describe("AgentRunner", () => {
           },
           channelThreadKey: "sentinel:telegram:thread-1",
         }),
+        expect.objectContaining({ onRuntimeEvent: expect.any(Function) }),
       );
     });
 

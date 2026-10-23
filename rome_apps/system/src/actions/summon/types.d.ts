@@ -35,6 +35,9 @@ export interface SummonSessionStartedEvent {
   readonly type: "rome_session_started";
   readonly agentName: string;
   readonly romeSession: RomeSessionRef;
+  /** The summoned agent's turn in `romeSession`. Absent when the run reports
+   * its session before its turn starts. */
+  readonly turnId?: string;
 }
 
 export interface SummonOutput {

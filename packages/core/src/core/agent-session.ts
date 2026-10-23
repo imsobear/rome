@@ -20,8 +20,9 @@ import {
   buildThreadContextBlock,
   type PromptBuilder,
 } from "./prompt-builder.js";
-import type { ActionRegistry, Action } from "../actions/types.js";
+import type { ActionRegistry, Action, ActionResult } from "../actions/types.js";
 import type { ActionEngine } from "../actions/engine.js";
+import { ActionChildTurns } from "./action-child-turns.js";
 import { validateActionArgs } from "../actions/validate-action-args.js";
 import type { RoutineActivationGate } from "./mcp-facade.js";
 import { chatRoutineKeyForToolUse } from "../routines/chat-routine-key.js";
@@ -38,6 +39,8 @@ import type {
   RomeSessionRef,
   RomeSessionType,
   StreamAgentEvent,
+  SubagentResultEvent,
+  SubagentStartEvent,
   TurnMiddlewareContext,
   ChatId,
   ChatRef,
@@ -794,6 +797,9 @@ interface TurnExecRefs {
   captureSubmittedOutput: (payload: unknown) => boolean;
   /** Attach the Child execution to this owner's provider tool call. */
   attachSubagentExecution: (toolUseId: string, execution: SubagentExecution) => void;
+  /** Publish a Child turn that an action started on this owner's outbound
+   * stream. Dropped when the owner has no active turn. */
+  publishActionChildTurn: (event: SubagentStartEvent | SubagentResultEvent) => void;
   /** Bind an async tool callback into the owner's OTel context. */
   bindTurnCtx: <T>(fn: () => T) => T;
 }
@@ -1174,6 +1180,7 @@ async function openSession(
     captureSubmittedOutput: (payload) => impl.captureSubmittedOutput(payload),
     attachSubagentExecution: (toolUseId, execution) =>
       impl.addSubagentExecution(toolUseId, execution),
+    publishActionChildTurn: (event) => impl.publishActionChildTurn(event),
     bindTurnCtx: inCurrentTurnCtx,
   };
 
@@ -1185,19 +1192,28 @@ async function openSession(
         // scopes `actions: [foo]` must not reach anything else in the registry.
         const action = findPermittedAction(name);
         if (!action) throw new Error(`Unknown action: ${name}`);
-        const result = await deps.actionEngine.run(
-          action.config.name,
-          input as Record<string, unknown>,
-          {
-            initiator: `agent:${key.agentName}`,
-            channelContext: refs.getThreadContext(),
-            sharedContext: refs.getSharedContext(),
-            sessionId: refs.sessionId,
-            agentName: key.agentName,
-            channelThreadKey: key.channelThreadKey,
-            turnId: refs.getTurnId(),
-          },
-        );
+        const childTurns = new ActionChildTurns(input, refs.publishActionChildTurn);
+        let result: ActionResult;
+        try {
+          result = await deps.actionEngine.run(
+            action.config.name,
+            input as Record<string, unknown>,
+            {
+              initiator: `agent:${key.agentName}`,
+              channelContext: refs.getThreadContext(),
+              sharedContext: refs.getSharedContext(),
+              sessionId: refs.sessionId,
+              agentName: key.agentName,
+              channelThreadKey: key.channelThreadKey,
+              turnId: refs.getTurnId(),
+            },
+            childTurns.observer,
+          );
+        } catch (err) {
+          childTurns.settleThrown(err);
+          throw err;
+        }
+        childTurns.settle(result);
         if (result.status === "pending_approval") {
           return {
             pendingApproval: true,
@@ -1676,6 +1692,7 @@ async function openSession(
         });
         maybeEmitForkSubagentStart(toolUseId);
       },
+      publishActionChildTurn: (event) => fork.emit(event),
       // Forked turns open no agent span; run tool callbacks on the ambient
       // OTel context instead of re-binding into a source turn's span.
       bindTurnCtx: (fn) => fn(),
@@ -3208,6 +3225,12 @@ class AgentSessionImpl implements AgentSession {
         });
       }
     }
+  }
+
+  publishActionChildTurn(event: SubagentStartEvent | SubagentResultEvent): void {
+    const sink = this.currentSink;
+    if (!sink) return;
+    this.publishOutbound(sink, event);
   }
 
   addSubagentExecution(toolUseId: string, execution: SubagentExecution): void {

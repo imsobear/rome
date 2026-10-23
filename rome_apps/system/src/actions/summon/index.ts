@@ -186,6 +186,7 @@ export async function executeSummon(
     let runError: string | undefined;
     let hasResult = false;
     let turnStarted = false;
+    let childTurnId: string | undefined;
     let turnStatus: "completed" | "interrupted" | "error" | undefined;
 
     for await (const msg of deps.agentRunner.run({
@@ -201,6 +202,7 @@ export async function executeSummon(
       if (msg.type === "turn_start") {
         turnStarted = true;
         resolvedSessionId = msg.sessionId;
+        childTurnId = msg.turnId;
         continue;
       }
       if (msg.type === "turn_end") {
@@ -214,6 +216,7 @@ export async function executeSummon(
           type: "rome_session_started",
           agentName,
           romeSession,
+          ...(childTurnId ? { turnId: childTurnId } : {}),
         });
       }
 
