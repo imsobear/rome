@@ -75,7 +75,13 @@ class WelcomeTurnMiddleware implements TurnMiddlewareHook {
     }
 
     try {
-      const reply = await runTurn(ctx.input.prompt ?? "", this.makeEffects(ctx));
+      const effects = this.makeEffects(ctx);
+      // The progress row is one per instance, so the chat that last took a turn
+      // is the one the landing screen sends the guardian back to.
+      if (effects.progress.get().sessionId !== ctx.session.id) {
+        effects.progress.patch({ sessionId: ctx.session.id });
+      }
+      const reply = await runTurn(ctx.input.prompt ?? "", effects);
       await this.emitReply(ctx, reply);
     } catch (err) {
       this.deps.logger.warn("welcome-to-rome turn failed; emitting fallback", {

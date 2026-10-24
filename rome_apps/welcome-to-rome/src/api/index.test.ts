@@ -2,11 +2,11 @@ import type { RomeAppApiRequest, RomeAppContext } from "@rome-os/app-runtime";
 import { beforeEach, describe, expect, it, rs } from "@rstest/core";
 import * as progressModule from "../db/repositories/progress.js" with { rstest: "importActual" };
 
-const mocks = rs.hoisted(() => ({ reset: rs.fn() }));
+const mocks = rs.hoisted(() => ({ reset: rs.fn(), get: rs.fn() }));
 
 rs.mock("../db/repositories/progress.js", () => ({
   ...progressModule,
-  createProgressRepository: () => ({ reset: mocks.reset }),
+  createProgressRepository: () => ({ reset: mocks.reset, get: mocks.get }),
 }));
 
 import { createApiHandler } from "./index.js";
@@ -37,6 +37,38 @@ function resetRequest(locale: unknown): RomeAppApiRequest {
 describe("welcome API", () => {
   beforeEach(() => {
     mocks.reset.mockReset();
+    mocks.get.mockReset();
+  });
+
+  it("reports where the welcome run stands and which chat it lives in", async () => {
+    mocks.get.mockReturnValue({
+      node: "await_question",
+      introRawInput: null,
+      introSummary: null,
+      ideas: [],
+      ideasGeneratedAt: null,
+      aiConnected: false,
+      completedAt: null,
+      sessionId: "chat-1",
+    });
+    const ctx = createContext();
+
+    const response = await createApiHandler(ctx).handle({
+      ...resetRequest(undefined),
+      method: "GET",
+      path: [],
+      body: undefined,
+    });
+
+    expect(await response.json()).toMatchObject({
+      agentName: "Rome",
+      progress: {
+        node: "await_question",
+        aiConnected: false,
+        completedAt: null,
+        sessionId: "chat-1",
+      },
+    });
   });
 
   it("persists the landing locale before resetting the scripted flow", async () => {

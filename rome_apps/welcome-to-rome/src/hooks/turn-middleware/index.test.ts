@@ -4,7 +4,31 @@ import type {
   TurnMiddlewareContext,
   TurnMiddlewareHookDeps,
 } from "@rome-os/app-runtime";
+import type { RomeAppContext } from "@rome-os/app-runtime";
 import { afterEach, describe, expect, it, rs } from "@rstest/core";
+import * as progressModule from "../../db/repositories/progress.js" with { rstest: "importActual" };
+
+const mocks = rs.hoisted(() => ({
+  row: { node: "done", sessionId: null as string | null },
+  patch: rs.fn(),
+}));
+
+rs.mock("../../db/repositories/progress.js", () => ({
+  ...progressModule,
+  createProgressRepository: () => ({
+    get: () => ({
+      introRawInput: null,
+      introSummary: null,
+      ideas: [],
+      ideasGeneratedAt: null,
+      aiConnected: true,
+      completedAt: null,
+      ...mocks.row,
+    }),
+    patch: mocks.patch,
+  }),
+}));
+
 import { createHook } from "./index.js";
 
 const logger: AppLogger = {
@@ -55,5 +79,24 @@ describe("welcome-to-rome turn middleware routing", () => {
 
     expect(next).toHaveBeenCalledOnce();
     expect(emitted).toEqual([]);
+  });
+
+  it("records the chat the welcome run is taking turns in", async () => {
+    rs.useFakeTimers();
+    mocks.row = { node: "done", sessionId: "older-chat" };
+    const appContext = {
+      db: {},
+      repositories: { settings: { get: rs.fn(async () => null), set: rs.fn() } },
+    } as unknown as RomeAppContext;
+    const deps: TurnMiddlewareHookDeps = { appId: "welcome-to-rome", logger, appContext };
+    const promise = createHook(deps).handle(
+      makeContext("welcome-to-rome:welcome-to-rome", []),
+      rs.fn(async () => {}),
+    );
+
+    await rs.runAllTimersAsync();
+    await promise;
+
+    expect(mocks.patch).toHaveBeenCalledWith({ sessionId: "session-1" });
   });
 });

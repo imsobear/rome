@@ -14,12 +14,13 @@ function requestLocale(request: RomeAppApiRequest): WelcomeLocale | undefined {
 }
 
 /**
- * welcome-to-rome app API. The only real route is `POST /reset`, which the
- * landing screen (src/web/App.tsx) calls before starting a chat so every entry
- * from the welcome screen replays the flow from a clean slate. When supplied,
- * the locale is persisted as the guardian's language before the chat starts.
- * Reset scope otherwise stays intentionally narrow: no memory or transcript is
- * touched.
+ * welcome-to-rome app API, called by the landing screen (src/web/App.tsx).
+ *
+ * - `GET /` returns the agent name and where the welcome run stands, so the
+ *   landing screen can offer to continue a run instead of starting a new one.
+ * - `POST /reset` clears the run before the landing screen opens a new chat.
+ *   When supplied, the locale is persisted as the guardian's language before
+ *   the chat starts. No memory or transcript is touched.
  */
 class WelcomeApiHandler implements RomeAppApiHandler {
   constructor(private readonly ctx: RomeAppContext) {}
@@ -28,10 +29,14 @@ class WelcomeApiHandler implements RomeAppApiHandler {
     const route = request.path.join("/");
 
     if (request.method === "GET" && request.path.length === 0) {
+      const { node, aiConnected, completedAt, sessionId } = createProgressRepository(
+        this.ctx.db,
+      ).get();
       return Response.json({
         appId: this.ctx.app.id,
         version: this.ctx.app.version,
         agentName: await this.getAgentName(),
+        progress: { node, aiConnected, completedAt, sessionId },
         status: "ok",
       });
     }
@@ -39,8 +44,7 @@ class WelcomeApiHandler implements RomeAppApiHandler {
     if (request.method === "POST" && route === "reset") {
       const locale = requestLocale(request);
       if (locale) await this.ctx.repositories.settings.set("guardianLanguage", locale);
-      const progress = createProgressRepository(this.ctx.db);
-      progress.reset();
+      createProgressRepository(this.ctx.db).reset();
       return Response.json({ ok: true });
     }
 
