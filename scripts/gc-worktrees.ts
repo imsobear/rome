@@ -165,6 +165,9 @@ const USAGE = `Usage: pnpm gc:worktrees [-y|--yes] [--include-locked] [--force]
 `;
 
 // slugify (mirrors scripts/worktree-slug.sh)
+//
+// It ignores ROME_DEV_SLUG on purpose. A stack pinned by ROME_DEV_SLUG is
+// shared by every branch, so removing one merged worktree must not remove it.
 
 function slugify(name: string): string {
   return name

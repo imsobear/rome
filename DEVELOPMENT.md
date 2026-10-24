@@ -149,6 +149,18 @@ rm -rf ~/.rome-worktrees/<slug>
 `git worktree remove` without first running `down -v` leaves an orphan
 host dir, but it cannot pollute any other worktree.
 
+The slug is the branch name, so switching branches in one checkout starts a
+different stack with its own data and address. To keep one stack across
+branches, set `ROME_DEV_SLUG` in your shell profile:
+
+```bash
+export ROME_DEV_SLUG=rome   # always http://rome.rome.localhost:3000
+```
+
+Every branch then shares that stack's data, including the database. A
+migration from one branch stays applied after you switch to a branch that does
+not have it.
+
 **Gotcha:** bare-metal `pnpm start` (host Node, no container) still
 writes to `~/.rome/<profile>/`, so it does *not* share state with
 `pnpm dev:all`. Mixing the two paths against the same source tree
